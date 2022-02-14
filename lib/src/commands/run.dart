@@ -1,9 +1,12 @@
+import 'dart:convert';
+
 import 'package:args/args.dart';
 import 'package:args/command_runner.dart';
 import 'package:mason/mason.dart';
 import 'package:meta/meta.dart';
 import 'package:universal_io/io.dart';
-import 'package:yaml/yaml.dart' as y;
+import 'package:very_good_cli/src/commands/yaml_manager.dart';
+import 'package:yaml/yaml.dart';
 
 // TODO(alestiago): Refactor and clean.
 
@@ -36,8 +39,18 @@ class RunCommand extends Command<int> {
 
     final scriptName =
         _argResults.rest.length == 1 ? _argResults.rest[0] : null;
-    final pubspec = Pubspec();
-    final scripts = await pubspec._availableSripts();
+    final scriptsYaml = YamlFile(fileName: 'scripts.yaml');
+    final pubspecYaml = YamlFile();
+
+    late final List<_Script> scripts;
+
+    if (await scriptsYaml.exists) {
+      scripts = await scriptsYaml.parseScripts();
+    } else if (await pubspecYaml.exists) {
+      scripts = await pubspecYaml.parseScripts();
+    } else {
+      throw UsageException('No scripts.yaml or pubspec.yaml found.', usage);
+    }
 
     if (scriptName == null) {
       _listScripts(scripts);
@@ -46,7 +59,7 @@ class RunCommand extends Command<int> {
       if (script.isEmpty) {
         throw UsageException('Script "$scriptName" not found', usage);
       } else {
-        await script.first();
+        await script.first(_logger);
       }
     }
 
@@ -63,40 +76,31 @@ class RunCommand extends Command<int> {
   }
 }
 
-@immutable
-class Pubspec {
-  const Pubspec({
-    this.path = 'pubspec.yaml',
-  });
+extension _YamlX on YamlFile {
+  static const _scriptsTag = 'scripts';
 
-  final String path;
+  Future<List<_Script>> parseScripts() async {
+    // TODO(alestiago): Throw error if failed.
+    final yamlMap = await read();
 
-  File _load() {
-    // TODO(alestiago): Throw exception if pubspec.yaml does not exist.
-    return File(path);
-  }
+    if (!yamlMap.value.containsKey(_scriptsTag)) {
+      throw UsageException(
+        'No scripts found',
+        'Ensure that scripts are defined in scripts.yaml or pubspec.yaml',
+      );
+    }
 
-  Future<Map> _loadYaml() async {
-    // TODO(alestiago): Throw exception if pubspec.yaml has invalid format.
-    final file = _load();
-    final contents = file.readAsStringSync();
-    return y.loadYaml(contents) as Map;
-  }
+    if (yamlMap.value[_scriptsTag] is! YamlList) {
+      throw UsageException(
+        'Scripts follow invalid format.',
+        'Ensure scripts are defined as a list',
+      );
+    }
 
-  Future<dynamic> fetchTag(String tag) async {
-    final yaml = await _loadYaml();
-    return yaml[tag];
-  }
-}
-
-extension _PubspecScript on Pubspec {
-  Future<List<_Script>> _availableSripts() async {
-    // TODO(alestiago): Thor error if failed.
-    const pubspec = Pubspec();
-    final yamlScripts = await pubspec.fetchTag('scripts') as List;
+    final yamlScripts = yamlMap.value[_scriptsTag] as YamlList;
     final scripts = <_Script>[];
 
-    for (final element in yamlScripts) {
+    for (final element in yamlScripts.value) {
       final scriptYaml = element as Map;
       final script = _Script.fromYaml(scriptYaml);
       scripts.add(script);
@@ -123,7 +127,7 @@ class _Script {
     final command = commands.first as Object;
     if (command is String) {
       return _Script(name: name, commands: [command]);
-    } else if (command is y.YamlList) {
+    } else if (command is YamlList) {
       final commands = command.value.map((dynamic e) => e as String).toList();
       return _Script(name: name, commands: commands);
     } else {
@@ -134,15 +138,20 @@ class _Script {
   final String name;
   final List<String> commands;
 
-  Future<void> call() async {
+  Future<void> call(Logger logger) async {
     for (final command in commands) {
-      await Process.run(
-        command,
-        [],
-        // TODO(alestiago): Allow specifing working directory.
-        // workingDirectory: workingDirectory,
+      // TODO(alestiago): Allow specifing working directory.
+      final arguments = command.split(' ');
+      final commandName = arguments.removeAt(0);
+
+      final process = await Process.start(
+        commandName,
+        arguments,
         runInShell: true,
       );
+      await for (final events in process.stdout.transform(utf8.decoder)) {
+        print(events);
+      }
     }
   }
 }
